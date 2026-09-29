@@ -1,0 +1,18 @@
+# 构建产物
+build/
+build_configure.log
+*.obj
+*.pdb
+*.ilk
+
+# 运行产物
+*.avi
+snapshot_*.png
+angles.csv
+
+# 发布包（体积大，按需重新生成）
+release/
+
+# 临时抓取的资料
+.csdn-article.html
+.csdn-article.txt

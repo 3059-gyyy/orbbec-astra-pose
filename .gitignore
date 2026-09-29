@@ -1,0 +1,68 @@
+# ============================================================================
+#  构建产物与本地文件（不入库）
+# ============================================================================
+
+# ---- 编译输出 ----
+build/
+build-*/
+out/
+bin/
+obj/
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# ---- CMake ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.stamp
+CMakeUserPresets.json
+build_configure.log
+
+# ---- 运行时产物 ----
+captures/
+captures_test/
+pose_ui.log
+*.log
+
+# ---- 便携包（体积大，用 Release 分发）----
+release/
+*.zip
+
+# ---- 模型权重：仓库内已附带 yolov8n-pose.onnx（约 13MB），如需自行下载见 models/README.txt ----
+*.onnx
+!pose-ui/models/yolov8n-pose.onnx
+
+# ---- 编辑器 / IDE ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- Python 虚拟环境（本地验证用）----
+venv*/
+__pycache__/
+*.pyc
+
+# ---- 临时验证脚本与截图 ----
+verify_*.py
+check*.py
+cmp*.py
+tmp/
+*.png
+*.avi
+*.mp4
