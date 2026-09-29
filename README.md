@@ -86,13 +86,20 @@ tools\build_local.cmd
 
 ## 打包（免安装）
 
-```powershell
-cd pose-ui
-powershell -ExecutionPolicy Bypass -File tools\make_portable.ps1
-```
+编译后的 `pose_ui.exe` 需要与 OpenCV 运行时 DLL、姿态模型放在同一目录。手动组包步骤：
 
-输出 `release/pose_ui_portable/`（含 exe、OpenCV 运行时 DLL、模型、启动脚本），
-可直接压缩分发。目标机器**无需安装任何环境**。
+1. 新建目录（例如 `pose_ui_portable\`）
+2. 复制 `build\pose_ui.exe`
+3. 复制 OpenCV 运行时（位于 OpenCV 安装目录 `build\x64\vc16\bin\`）：
+   `opencv_world4100.dll`、`opencv_videoio_ffmpeg4100_64.dll`、`opencv_videoio_msmf4100_64.dll`
+4. 复制 MSVC 运行库：`msvcp140*.dll`、`vcruntime140*.dll`、`concrt140.dll`
+   （位于 `C:\Windows\System32`，或使用 VS 的 `vc_redist` 安装包）
+5. 复制 `models\` 目录（含 `yolov8n-pose.onnx`）与 `licenses\`
+6. 复制 `config.json` 与启动脚本
+
+命令行版提供了自动打包脚本可作参考：`orbbec-pose-overlay\tools\make_portable.ps1`。
+
+组好的目录可直接压缩分发，目标机器**无需安装任何环境**（实测在干净 PATH 下运行正常）。
 
 ---
 
