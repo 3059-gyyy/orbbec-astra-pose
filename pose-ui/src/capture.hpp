@@ -16,6 +16,7 @@
 // ============================================================================
 #pragma once
 
+#include <chrono>
 #include <string>
 
 #include <opencv2/core.hpp>
@@ -73,7 +74,11 @@ class VideoRecorder {
   int frames_ = 0;
   int skipped_ = 0;
   double fps_ = 25.0;
-  double assumedSourceFps_ = 12.0;
+  // 按真实经过时间补帧：界面帧率会随推理耗时波动（实测 3~13 fps），
+  // 用固定的"假定源帧率"换算会让回放时长成倍偏差。
+  std::chrono::steady_clock::time_point startTp_{};
+  double elapsedBefore_ = 0.0;   // 上一帧之前的真实经过时间（秒）
+  double carry_ = 0.0;           // 补帧份数的小数余量，避免长期累积误差
   std::string path_;
   std::string error_;
 };

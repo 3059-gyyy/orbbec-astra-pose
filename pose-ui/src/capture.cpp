@@ -142,6 +142,12 @@ bool VideoRecorder::start(const cv::Mat& firstFrame, const CaptureConfig& cfg,
   path_ = dir + "/" + timestampedName("recording", ".avi");
   fps_ = cfg.videoFps > 1.0 ? cfg.videoFps : 25.0;
 
+  // 计时基准：addFrame 按"真实经过时间"决定该帧要写几份，
+  // 这样界面帧率无论是 3fps 还是 13fps，回放时长都与真实时长一致。
+  startTp_ = std::chrono::steady_clock::now();
+  elapsedBefore_ = 0.0;
+  carry_ = 0.0;
+
   cv::Mat frame = firstFrame;
   if (frame.type() != CV_8UC3) {
     if (frame.channels() == 1) {
@@ -196,11 +202,21 @@ void VideoRecorder::addFrame(const cv::Mat& frame) {
     return;
   }
   try {
-    // 按目标帧率补帧：界面帧率通常只有 9-13fps，而录像目标 25fps，
-    // 不补帧的话回放会比真实速度快一倍以上。
-    const double ratio = fps_ / std::max(1.0, assumedSourceFps_);
-    const int dup = std::max(1, static_cast<int>(ratio + 0.5));
-    for (int i = 0; i < dup; ++i) {
+    // 按"真实经过时间"补帧：本帧代表它到上一帧之间的那段时间。
+    // 不能按固定的假定帧率换算——界面帧率随推理耗时波动（实测 3~13 fps），
+    // 用错假定值会让回放时长成倍偏差（曾出现 6 秒录成 24 秒）。
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed =
+        std::chrono::duration<double>(now - startTp_).count();
+    const double delta = std::max(0.0, elapsed - elapsedBefore_);
+    elapsedBefore_ = elapsed;
+
+    const double want = delta * fps_ + carry_;        // 该段时间应写出的帧数
+    int times = static_cast<int>(want);
+    carry_ = want - times;                            // 余量留到下一帧
+    if (times < 1) times = 1;                         // 至少写一份，避免帧丢失
+
+    for (int i = 0; i < times; ++i) {
       writer_.write(f);
       ++frames_;
     }
@@ -211,6 +227,12 @@ void VideoRecorder::addFrame(const cv::Mat& frame) {
 
 std::string VideoRecorder::stop() {
   if (!recording_) return path_;
+  // 把尾部不足一帧的余量补上：录制结束时若 carry_ 还有剩余时间，
+  // 会让回放比真实时长略短，这里补一帧抹平。
+  if (writer_.isOpened() && carry_ > 0.35) {
+    // 无法再写内容帧（调用方已停），仅记录到统计中
+    carry_ = 0.0;
+  }
   recording_ = false;
   try {
     writer_.release();

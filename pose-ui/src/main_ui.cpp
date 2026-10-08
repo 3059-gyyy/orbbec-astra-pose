@@ -53,7 +53,7 @@
 namespace {
 
 // 版本号：每次修改后递增，便于确认运行的是哪一版（窗口标题与启动日志都会显示）
-constexpr const char* kAppVersion = "v1.9 (demo skeleton opt-in, no camera contention)";
+constexpr const char* kAppVersion = "v2.0 (accurate recording duration)";
 // GL 函数指针/常量在 gl:: 命名空间（见 gl_loader.hpp）
 using namespace gl;
 
@@ -1171,7 +1171,7 @@ int main(int argc, char** argv) {
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
   glfwWindowHint(GLFW_SAMPLES, 4);
 
-  GLFWwindow* win = glfwCreateWindow(1680, 980, "Orbbec Astra+ 骨骼与三维可视化  v1.9", nullptr, nullptr);
+  GLFWwindow* win = glfwCreateWindow(1680, 980, "Orbbec Astra+ 骨骼与三维可视化  v2.0", nullptr, nullptr);
   if (!win) {
     std::fprintf(stderr, "创建窗口失败（需要 OpenGL 3.3）\n");
     glfwTerminate();
