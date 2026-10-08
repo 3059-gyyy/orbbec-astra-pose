@@ -53,7 +53,7 @@
 namespace {
 
 // 版本号：每次修改后递增，便于确认运行的是哪一版（窗口标题与启动日志都会显示）
-constexpr const char* kAppVersion = "v2.0 (accurate recording duration)";
+constexpr const char* kAppVersion = "v2.1 (time-accurate recording, capped render loop)";
 // GL 函数指针/常量在 gl:: 命名空间（见 gl_loader.hpp）
 using namespace gl;
 
@@ -252,6 +252,12 @@ struct AppState {
   // 演示骨骼（合成火柴人，仅用于验证坐标/角度链路；默认关闭）
   // 打开时会在状态栏给出醒目警告，避免被误认为真实检测结果。
   bool demoSkeleton = false;
+
+  // 真实采集帧率统计（每渲染帧一次），供录像与界面显示
+  double measT0 = 0.0;
+  int measFrames = 0;
+  double measuredFps = 0.0;
+  bool frameIsNew = false;          // 本帧是否为数据源新送来的一帧
 
   // ---- 截图 / 录像 ----
   ui::CaptureConfig capCfg;        // 保存目录与格式（可被 config.json 覆盖）
@@ -629,7 +635,8 @@ void drawDisplayPanel() {
 
     if (rec) {
       ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.45f, 1.0f));
-      ImGui::Text("● 录制中  %d 帧 / %.1f 秒", g.recorder.frameCount(), g.recorder.seconds());
+      ImGui::Text("● 录制中  %d 帧 / %.1f 秒 / %.1f fps", g.recorder.frameCount(),
+                  g.recorder.seconds(), g.recorder.fileFps());
       ImGui::PopStyleColor();
       ImGui::PushTextWrapPos(0.0f);
       ImGui::TextDisabled("%s", g.recorder.path().c_str());
@@ -764,7 +771,7 @@ void drawStatusBar() {
                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
   const ui::Sample& s = g.sample;
-  ImGui::Text("FPS %.1f", s.frameFps);
+  ImGui::Text("采集 %.1f fps", g.measuredFps > 0.5 ? g.measuredFps : s.frameFps);
   ImGui::SameLine(0, 22);
   ImGui::Text("画面 %d x %d", s.colorW, s.colorH);
   ImGui::SameLine(0, 22);
@@ -1171,7 +1178,7 @@ int main(int argc, char** argv) {
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
   glfwWindowHint(GLFW_SAMPLES, 4);
 
-  GLFWwindow* win = glfwCreateWindow(1680, 980, "Orbbec Astra+ 骨骼与三维可视化  v2.0", nullptr, nullptr);
+  GLFWwindow* win = glfwCreateWindow(1680, 980, "Orbbec Astra+ 与三维可视化  v2.1", nullptr, nullptr);
   if (!win) {
     std::fprintf(stderr, "创建窗口失败（需要 OpenGL 3.3）\n");
     glfwTerminate();
@@ -1221,6 +1228,7 @@ int main(int argc, char** argv) {
   double lastDevScan = 0.0;   // 上次设备扫描时间（用于自动重扫）
 
   while (!glfwWindowShouldClose(win)) {
+    const double frameStart = glfwGetTime();
     glfwPollEvents();
 
     // 取最新一帧（拷贝，后续可自由修改关节坐标做镜像/缩放）
@@ -1230,6 +1238,7 @@ int main(int argc, char** argv) {
       if (g.sample.timestampUs != g.lastFrameStamp) {
         g.lastFrameStamp = g.sample.timestampUs;
         g.cloudDirty = true;
+        g.frameIsNew = true;   // 本帧是数据源新送来的一帧（供录制/帧率统计）
       }
     }
     if (!g.opt.cameraOn) {
@@ -1252,24 +1261,29 @@ int main(int argc, char** argv) {
       // 站立姿势：脚底 y=640（地面），头顶 y=140，人体中心 x=640
       const float groundY = 640.f;
       const float centerX = 640.f;
+      // 让演示骨骼轻微动起来（手臂摆动 + 重心起伏）：
+      // 静态画面既无法验证录像的帧内容，也会让"重复帧"检测失效。
+      const double tt = ImGui::GetTime();
+      const float swing = static_cast<float>(std::sin(tt * 2.0) * 30.0);   // 手臂摆动
+      const float bob = static_cast<float>(std::sin(tt * 4.0) * 6.0);      // 重心起伏
       auto put = [&](pose::JointId id, float x, float y) {
         const int k = static_cast<int>(id);
         sk.joints2d[k] = pose::Vec2{x, y, true};
         sk.conf[k] = 1.f;
       };
-      put(pose::JointId::Head, centerX + 4.f, 150.f);
-      put(pose::JointId::Neck, centerX, 200.f);
-      put(pose::JointId::Spine, centerX, 300.f);
-      put(pose::JointId::ShoulderL, centerX - 90.f, 215.f);
-      put(pose::JointId::ElbowL, centerX - 140.f, 340.f);
-      put(pose::JointId::WristL, centerX - 165.f, 460.f);
-      put(pose::JointId::ShoulderR, centerX + 90.f, 215.f);
-      put(pose::JointId::ElbowR, centerX + 140.f, 340.f);
-      put(pose::JointId::WristR, centerX + 165.f, 460.f);
-      put(pose::JointId::HipL, centerX - 55.f, 430.f);
+      put(pose::JointId::Head, centerX + 4.f, 150.f + bob);
+      put(pose::JointId::Neck, centerX, 200.f + bob);
+      put(pose::JointId::Spine, centerX, 300.f + bob);
+      put(pose::JointId::ShoulderL, centerX - 90.f, 215.f + bob);
+      put(pose::JointId::ElbowL, centerX - 140.f + swing, 340.f);
+      put(pose::JointId::WristL, centerX - 165.f + swing * 1.6f, 460.f);
+      put(pose::JointId::ShoulderR, centerX + 90.f, 215.f + bob);
+      put(pose::JointId::ElbowR, centerX + 140.f - swing, 340.f);
+      put(pose::JointId::WristR, centerX + 165.f - swing * 1.6f, 460.f);
+      put(pose::JointId::HipL, centerX - 55.f, 430.f + bob);
       put(pose::JointId::KneeL, centerX - 62.f, 535.f);
       put(pose::JointId::AnkleL, centerX - 66.f, 632.f);
-      put(pose::JointId::HipR, centerX + 55.f, 430.f);
+      put(pose::JointId::HipR, centerX + 55.f, 430.f + bob);
       put(pose::JointId::KneeR, centerX + 62.f, 535.f);
       put(pose::JointId::AnkleR, centerX + 66.f, 632.f);
       put(pose::JointId::FootL, centerX - 66.f, 632.f);
@@ -1457,13 +1471,40 @@ int main(int argc, char** argv) {
       doSnapshot();
     }
 
-    // 保存本帧已绘制完的画面：供"截图/录像"按键使用（下一帧生效）
+    // 保存本帧已绘制完的画面：供"截图/录像"按键使用。
+    // 关键：只有"数据源送来新一帧"时才更新录制缓冲与帧率统计——渲染循环可达
+    // 120fps 而相机只有 ~10fps，若按渲染帧录制，同一画面会被反复写入，
+    // 帧率与时长都会失真（实测 3 秒录成 19.8 秒）。
     if (!g.canvas.empty()) {
-      g.lastCanvas = g.canvas.clone();
-      if (g.recorder.recording()) g.recorder.addFrame(g.lastCanvas);
+      // 合成演示骨骼、或数据源暂未出帧时，没有"新帧"概念，按界面帧率录制；
+      // 有真实数据源时只录新帧（渲染可达 120fps 而相机 ~10fps，
+      // 若按渲染帧录制会把同一画面反复写入，帧率与时长都会失真）。
+      const bool sourceDriven = g.sample.valid && !g.demoSkeleton;
+      if (!sourceDriven || g.frameIsNew) {
+        g.lastCanvas = g.canvas.clone();
+        const double t = ImGui::GetTime();
+        if (g.measT0 <= 0.0) g.measT0 = t;
+        ++g.measFrames;
+        if (t - g.measT0 >= 1.5) {
+          g.measuredFps = g.measFrames / (t - g.measT0);
+          g.measT0 = t;
+          g.measFrames = 0;
+        }
+      }
+      if (g.recorder.recording()) g.recorder.addFrame(g.canvas);
+      g.frameIsNew = false;   // 消费掉本帧标记
     }
 
     glfwSwapBuffers(win);
+
+    // 帧率上限：没有新数据时不必全速重绘。实测空转可达 120fps——既浪费 CPU，
+    // 又让"按帧录制"的录像帧率虚高（同一画面被反复写入，时长随之失真）。
+    // 30fps 对界面完全够用，也让录制节奏贴近真实数据速率。
+    {
+      const double busy = glfwGetTime() - frameStart;
+      const double budget = 1.0 / 30.0;
+      if (busy < budget) glfwWaitEventsTimeout(budget - busy);
+    }
   }
 
   shutdownGuard.run();   // 幂等：先收线程与采集，再释放 GL 资源

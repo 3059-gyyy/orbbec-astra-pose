@@ -21,6 +21,10 @@
 namespace ui {
 namespace {
 
+// 录制期间的内存缓存上限（约 60 秒 @ 25fps）。超出后丢弃后续帧，
+// 以免长录制把内存吃满；正常使用时远达不到这个量。
+constexpr int kMaxBufferedFrames = 1500;
+
 int fourcc(char a, char b, char c, char d) {
   return cv::VideoWriter::fourcc(a, b, c, d);
 }
@@ -120,7 +124,10 @@ long long VideoRecorder::writtenBytes() const {
 }
 
 double VideoRecorder::seconds() const {
-  return fps_ > 0.0 ? static_cast<double>(frames_) / fps_ : 0.0;
+  // 录制中用真实经过时间；停止后返回本次录制总时长（供界面显示）
+  if (!recording_) return lastSeconds_;
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - startTp_)
+      .count();
 }
 
 bool VideoRecorder::start(const cv::Mat& firstFrame, const CaptureConfig& cfg,
@@ -130,6 +137,8 @@ bool VideoRecorder::start(const cv::Mat& firstFrame, const CaptureConfig& cfg,
   skipped_ = 0;
   frames_ = 0;
   path_.clear();
+  pendingFrames_.clear();
+  measuredSrcFps_ = 0.0;
 
   if (firstFrame.empty()) {
     error_ = "当前没有可用画面";
@@ -140,13 +149,15 @@ bool VideoRecorder::start(const cv::Mat& firstFrame, const CaptureConfig& cfg,
   const std::string dir = cfg.rootDir + "/" + cfg.videoSub;
   ensureDirectory(dir);
   path_ = dir + "/" + timestampedName("recording", ".avi");
-  fps_ = cfg.videoFps > 1.0 ? cfg.videoFps : 25.0;
 
-  // 计时基准：addFrame 按"真实经过时间"决定该帧要写几份，
-  // 这样界面帧率无论是 3fps 还是 13fps，回放时长都与真实时长一致。
+  // 目标帧率只作为上限：真正的文件帧率由"实测采集帧率"决定，
+  // 这样文件里保留的是原始帧（允许跳帧），而不是靠复制帧撑出来的时长。
+  fps_ = cfg.videoFps > 1.0 ? cfg.videoFps : 25.0;
+  fileFps_ = fps_;
+
+  // 计时基准
   startTp_ = std::chrono::steady_clock::now();
-  elapsedBefore_ = 0.0;
-  carry_ = 0.0;
+  lastFrameTp_ = startTp_;
 
   cv::Mat frame = firstFrame;
   if (frame.type() != CV_8UC3) {
@@ -156,34 +167,21 @@ bool VideoRecorder::start(const cv::Mat& firstFrame, const CaptureConfig& cfg,
       cv::cvtColor(frame, frame, cv::COLOR_BGRA2BGR);
     }
   }
-
-  // MJPG：Windows 自带解码器，文件大但绝对能播；打不开时退回默认编码
-  bool ok = false;
-  try {
-    ok = writer_.open(path_, fourcc('M', 'J', 'P', 'G'), fps_,
-                      cv::Size(frame.cols, frame.rows), true);
-    if (!ok) ok = writer_.open(path_, 0, fps_, cv::Size(frame.cols, frame.rows), true);
-  } catch (const std::exception& e) {
-    error_ = e.what();
-  } catch (...) {
-    error_ = "未知异常";
-  }
-
-  if (!ok) {
-    error_ = error_.empty() ? "无法创建视频文件（检查目录权限/磁盘空间）" : error_;
-    if (message) *message = "录制失败：" + error_;
-    return false;
-  }
-
-  recording_ = true;
-  width_ = frame.cols;      // 自己记录尺寸，不要依赖 writer_.get()（写入端返回 0）
+  width_ = frame.cols;
   height_ = frame.rows;
-  writer_.write(frame);
-  ++frames_;
-  if (message) *message = "开始录制 -> " + path_;
+
+  // 先不建文件：用约 1.2 秒测量真实采集帧率，再按该帧率建立视频。
+  // 早先直接按目标 25fps 建文件、再用重复帧补齐，会出现"原始帧很少、
+  // 重复帧很多"的情况；现在改为按实测帧率写入，保留原始帧。
+  pendingFrames_.push_back(frame.clone());
+  recording_ = true;
+  if (message) {
+    *message = "开始录制（正在测量实际帧率）-> " + path_;
+  }
   return true;
 }
 
+// 打开视频文件（测量结束后调用），用实测帧率作为文件帧率
 void VideoRecorder::addFrame(const cv::Mat& frame) {
   if (!recording_ || frame.empty()) return;
   cv::Mat f = frame;
@@ -194,51 +192,101 @@ void VideoRecorder::addFrame(const cv::Mat& frame) {
       cv::cvtColor(f, f, cv::COLOR_BGRA2BGR);
     }
   }
-  // 尺寸与录制开始时不一致（例如切换视图/分辨率）则跳过，避免写出损坏文件。
-  // 注意：这里比较的是自己记录的尺寸，不能用 writer_.get()——写入端会返回 0，
-  // 那样除首帧外所有帧都会被误判为"尺寸不符"而丢弃。
-  if (!writer_.isOpened() || f.cols != width_ || f.rows != height_) {
-    ++skipped_;
+
+  // 录制期间只缓存原始帧，不写盘：
+  //   * MJPEG 编码与落盘会拖慢主循环（实测写入阶段帧率从 46fps 掉到 29fps），
+  //     所以"一边测一边写"无法得到可信的帧率——测出来的值总比实际写入时高。
+  //   * 改为结束时按"总帧数 / 真实时长"一次性写盘，帧率与实际写入速率天然一致，
+  //     回放时长因此与真实时长吻合（跳帧可接受，不做重复帧填充）。
+  if (width_ <= 0 || height_ <= 0) {
+    width_ = f.cols;
+    height_ = f.rows;
+  }
+  if (f.cols != width_ || f.rows != height_) {
+    ++skipped_;   // 中途改了视图/分辨率，跳过以保证文件一致
     return;
   }
-  try {
-    // 按"真实经过时间"补帧：本帧代表它到上一帧之间的那段时间。
-    // 不能按固定的假定帧率换算——界面帧率随推理耗时波动（实测 3~13 fps），
-    // 用错假定值会让回放时长成倍偏差（曾出现 6 秒录成 24 秒）。
-    const auto now = std::chrono::steady_clock::now();
-    const double elapsed =
-        std::chrono::duration<double>(now - startTp_).count();
-    const double delta = std::max(0.0, elapsed - elapsedBefore_);
-    elapsedBefore_ = elapsed;
 
-    const double want = delta * fps_ + carry_;        // 该段时间应写出的帧数
-    int times = static_cast<int>(want);
-    carry_ = want - times;                            // 余量留到下一帧
-    if (times < 1) times = 1;                         // 至少写一份，避免帧丢失
-
-    for (int i = 0; i < times; ++i) {
-      writer_.write(f);
-      ++frames_;
-    }
-  } catch (...) {
-    ++skipped_;
+  if (static_cast<int>(pendingFrames_.size()) < kMaxBufferedFrames) {
+    pendingFrames_.push_back(f.clone());
+    ++frames_;
+  } else {
+    ++skipped_;   // 超出缓存上限（超长录制）后不再追加
   }
+  lastFrameTp_ = std::chrono::steady_clock::now();
 }
-
 std::string VideoRecorder::stop() {
   if (!recording_) return path_;
-  // 把尾部不足一帧的余量补上：录制结束时若 carry_ 还有剩余时间，
-  // 会让回放比真实时长略短，这里补一帧抹平。
-  if (writer_.isOpened() && carry_ > 0.35) {
-    // 无法再写内容帧（调用方已停），仅记录到统计中
-    carry_ = 0.0;
-  }
+  const auto now = std::chrono::steady_clock::now();
+  lastSeconds_ = std::chrono::duration<double>(now - startTp_).count();
   recording_ = false;
+
+  if (pendingFrames_.empty()) {
+    return path_;
+  }
+
+  // 文件帧率 = 总帧数 / 真实录制时长：与"实际写入速率"天然一致，
+  // 回放时长因此与真实时长吻合。上限不超过用户设定的目标帧率。
+  const double realFps = lastSeconds_ > 0.05
+                             ? static_cast<double>(pendingFrames_.size()) / lastSeconds_
+                             : fps_;
+  measuredSrcFps_ = realFps;
+
+  // 文件帧率目标：不超过用户设定值。若真实内容速率高于目标，
+  // 就"均匀抽帧"降到目标帧率（跳帧可接受），这样时长仍然对齐；
+  // 否则直接按真实速率写，时长同样对齐。
+  fileFps_ = std::min(fps_, std::max(1.0, realFps));
+  const int want = std::max(1, static_cast<int>(lastSeconds_ * fileFps_ + 0.5));
+  if (static_cast<int>(pendingFrames_.size()) > want) {
+    std::vector<cv::Mat> picked;
+    picked.reserve(static_cast<size_t>(want));
+    const size_t total = pendingFrames_.size();
+    for (int i = 0; i < want; ++i) {
+      const size_t src =
+          std::min(total - 1, static_cast<size_t>(static_cast<double>(i) * total / want));
+      picked.push_back(pendingFrames_[src]);
+    }
+    std::printf("[rec] 内容速率 %.1f fps 高于目标 %.1f fps：均匀抽帧 %zu -> %d 帧\n",
+                realFps, fps_, total, want);
+    std::fflush(stdout);
+    pendingFrames_.swap(picked);
+  }
+
+  bool ok = false;
+  try {
+    ok = writer_.open(path_, fourcc('M', 'J', 'P', 'G'), fileFps_,
+                      cv::Size(width_, height_), true);
+    if (!ok) ok = writer_.open(path_, 0, fileFps_, cv::Size(width_, height_), true);
+  } catch (const std::exception& e) {
+    error_ = e.what();
+  } catch (...) {
+    error_ = "未知异常";
+  }
+  if (!ok) {
+    error_ = error_.empty() ? "无法创建视频文件（检查目录权限/磁盘空间）" : error_;
+    pendingFrames_.clear();
+    return path_;
+  }
+
+  int written = 0;
+  for (const auto& f : pendingFrames_) {
+    try {
+      writer_.write(f);
+      ++written;
+    } catch (...) {
+      ++skipped_;
+    }
+  }
   try {
     writer_.release();
   } catch (...) {
   }
+  pendingFrames_.clear();
+  frames_ = written;
+
+  std::printf("[rec] 录制 %.2f 秒 / %d 帧 -> 文件帧率 %.2f fps（真实速率，无重复填充）\n",
+              lastSeconds_, written, fileFps_);
+  std::fflush(stdout);
   return path_;
 }
-
 }  // namespace ui

@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -56,11 +57,14 @@ class VideoRecorder {
 
   bool recording() const { return recording_; }
   int frameCount() const { return frames_; }
-  double seconds() const;
+  double seconds() const;        // 录制中=已录真实时长；结束后=本次录制总时长
   const std::string& path() const { return path_; }
   const std::string& lastError() const { return error_; }
   int skipped() const { return skipped_; }
-  double targetFps() const { return fps_; }
+  double targetFps() const { return fps_; }        // 目标帧率上限
+  double fileFps() const { return fileFps_; }      // 实际写入文件的帧率
+  double measuredSrcFps() const { return measuredSrcFps_; }   // 实测采集帧率
+  int pendingCount() const { return static_cast<int>(pendingFrames_.size()); }
   // 已写入文件的真实字节数（用于避免 AVI 触到 2GB 上限）。
   // 注意：不能按"字节/像素"估算——实测同一分辨率下帧大小可能相差千倍
   // （合成画面约 5KB/帧，实拍约 1.4MB/帧），估算会导致误判提前停止。
@@ -74,11 +78,18 @@ class VideoRecorder {
   int frames_ = 0;
   int skipped_ = 0;
   double fps_ = 25.0;
-  // 按真实经过时间补帧：界面帧率会随推理耗时波动（实测 3~13 fps），
-  // 用固定的"假定源帧率"换算会让回放时长成倍偏差。
+  double fileFps_ = 25.0;   // 实际写入文件的帧率（结束时按真实速率确定）
+  double lastSeconds_ = 0.0; // 上一次录制的总时长（停止后仍可读取）
+  // 时间轴策略（避免"6 秒录成 24 秒"这类问题）：
+  //   录制期间只把原始帧缓存进内存（不写盘），结束时一次性写盘，并把文件帧率
+  //   设为"总帧数 / 真实录制时长"——文件帧率与真实节奏天然一致，回放时长因此
+  //   与真实时长吻合。若内容速率高于目标帧率则均匀抽帧（跳帧可接受）。
+  //   之所以不"边测边写"：MJPEG 编码与落盘会拖慢主循环，写盘阶段的帧率
+  //   明显低于空转阶段（实测 46fps -> 29fps），先测后写必然高估、回放被拉长。
   std::chrono::steady_clock::time_point startTp_{};
-  double elapsedBefore_ = 0.0;   // 上一帧之前的真实经过时间（秒）
-  double carry_ = 0.0;           // 补帧份数的小数余量，避免长期累积误差
+  std::chrono::steady_clock::time_point lastFrameTp_{};   // 最近一帧到达时刻
+  double measuredSrcFps_ = 0.0;                         // 实测内容速率
+  std::vector<cv::Mat> pendingFrames_;                  // 录制期间缓存的原始帧
   std::string path_;
   std::string error_;
 };
